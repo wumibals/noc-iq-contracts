@@ -99,19 +99,18 @@ fn test_config_snapshot_is_deterministic_and_complete() {
     assert_eq!(snapshot.version, symbol_short!("v1"));
     assert_eq!(snapshot.entries.len(), 4);
 
-    let critical = snapshot.entries.get(0).unwrap();
-    let high = snapshot.entries.get(1).unwrap();
-    let medium = snapshot.entries.get(2).unwrap();
-    let low = snapshot.entries.get(3).unwrap();
+    let expected = [
+        (symbol_short!("critical"), 15u32),
+        (symbol_short!("high"), 30u32),
+        (symbol_short!("medium"), 60u32),
+        (symbol_short!("low"), 120u32),
+    ];
 
-    assert_eq!(critical.severity, symbol_short!("critical"));
-    assert_eq!(critical.config.threshold_minutes, 15);
-    assert_eq!(high.severity, symbol_short!("high"));
-    assert_eq!(high.config.threshold_minutes, 30);
-    assert_eq!(medium.severity, symbol_short!("medium"));
-    assert_eq!(medium.config.threshold_minutes, 60);
-    assert_eq!(low.severity, symbol_short!("low"));
-    assert_eq!(low.config.threshold_minutes, 120);
+    for (i, (severity, threshold)) in expected.iter().enumerate() {
+        let entry = snapshot.entries.get(i as u32).unwrap();
+        assert_eq!(entry.severity, severity.clone());
+        assert_eq!(entry.config.threshold_minutes, *threshold);
+    }
 }
 
 #[test]
@@ -900,7 +899,7 @@ fn test_calculate_sla_view_matches_mutating_and_does_not_mutate() {
         "Mutating function must mutate stats"
     );
 
-    // 6. Ensure results are perfectly identical
+    // 6. Ensure results are perfectly identical, including backend-visible metadata.
     assert_eq!(view_result.status, mut_result.status);
     assert_eq!(view_result.amount, mut_result.amount);
     assert_eq!(view_result.rating, mut_result.rating);
@@ -908,6 +907,7 @@ fn test_calculate_sla_view_matches_mutating_and_does_not_mutate() {
     assert_eq!(view_result.mttr_minutes, mut_result.mttr_minutes);
     assert_eq!(view_result.threshold_minutes, mut_result.threshold_minutes);
     assert_eq!(view_result.outage_id, mut_result.outage_id);
+    assert_eq!(view_result.recorded_at, mut_result.recorded_at);
 }
 // ============================================================
 // #32 – Contract Economic Stress Test Suite
@@ -1104,6 +1104,43 @@ fn test_config_version_hash_is_deterministic() {
     let h1 = client.get_config_version_hash();
     let h2 = client.get_config_version_hash();
     assert_eq!(h1, h2);
+}
+
+#[test]
+fn test_canonical_severity_order_is_aligned_across_snapshot_and_metadata() {
+    let (_env, client, _actors) = setup();
+
+    let snapshot = client.get_config_snapshot();
+    let metadata = client.get_contract_metadata();
+
+    assert_eq!(snapshot.entries.len(), metadata.supported_severities.len());
+
+    for i in 0..snapshot.entries.len() {
+        let snapshot_severity = snapshot.entries.get(i).unwrap().severity;
+        let metadata_severity = metadata.supported_severities.get(i).unwrap();
+        assert_eq!(snapshot_severity, metadata_severity);
+    }
+}
+
+#[test]
+fn test_canonical_severity_order_survives_config_updates() {
+    let (_env, client, actors) = setup();
+
+    client.set_config(&actors.admin, &symbol_short!("low"), &240, &15, &900);
+    client.set_config(&actors.admin, &symbol_short!("critical"), &20, &150, &800);
+
+    let snapshot = client.get_config_snapshot();
+    let expected = [
+        symbol_short!("critical"),
+        symbol_short!("high"),
+        symbol_short!("medium"),
+        symbol_short!("low"),
+    ];
+
+    for (i, severity) in expected.iter().enumerate() {
+        let entry = snapshot.entries.get(i as u32).unwrap();
+        assert_eq!(entry.severity, severity.clone());
+    }
 }
 
 #[test]
@@ -1621,6 +1658,19 @@ fn test_get_contract_metadata_severities_are_canonical() {
         meta.supported_severities.get(3).unwrap(),
         symbol_short!("low")
     );
+    let expected = [
+        symbol_short!("critical"),
+        symbol_short!("high"),
+        symbol_short!("medium"),
+        symbol_short!("low"),
+    ];
+
+    for (i, severity) in expected.iter().enumerate() {
+        assert_eq!(
+            meta.supported_severities.get(i as u32).unwrap(),
+            severity.clone()
+        );
+    }
 }
 
 #[test]
@@ -1631,6 +1681,7 @@ fn test_get_contract_metadata_is_deterministic() {
     assert_eq!(m1.storage_version, m2.storage_version);
     assert_eq!(m1.result_schema_version, m2.result_schema_version);
     assert_eq!(m1.contract_name, m2.contract_name);
+    assert_eq!(m1.supported_severities, m2.supported_severities);
 }
 
 // ============================================================
@@ -3457,6 +3508,7 @@ fn test_event_replay_view_function_produces_same_result_as_stored() {
     assert_eq!(stored.payment_type, replayed.payment_type);
     assert_eq!(stored.mttr_minutes, replayed.mttr_minutes);
     assert_eq!(stored.threshold_minutes, replayed.threshold_minutes);
+    assert_eq!(stored.recorded_at, replayed.recorded_at);
 }
 
 #[test]
@@ -4105,7 +4157,7 @@ fn test_storage_growth_regression_mixed_operations() {
 // are explicitly documented and isolated below.
 // ============================================================
 
-/// Helper: call both paths and assert all result fields except `recorded_at` match.
+/// Helper: call both paths and assert full result parity.
 fn assert_invariant(
     client: &SLACalculatorContractClient,
     operator: &soroban_sdk::Address,
@@ -4153,6 +4205,11 @@ fn assert_invariant(
     );
     // Documented allowed difference: recorded_at is 0 for view, ledger timestamp for mutating.
     assert_eq!(view.recorded_at, 0, "view recorded_at must always be 0");
+    assert_eq!(
+        view.recorded_at, mutating.recorded_at,
+        "recorded_at mismatch mttr={}",
+        mttr
+    );
 }
 
 #[test]

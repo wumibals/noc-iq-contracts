@@ -24,21 +24,24 @@ const CONFIGS: Record<string, SlaConfig> = {
   medium: { threshold: 480, penaltyBps: 100 },
 };
 
+const CANONICAL_SEVERITIES = ["critical", "high", "medium"] as const;
+
 describe("SC-046 Threshold Edge Cases", () => {
   it("zero MTTR always meets any positive threshold", () => {
-    for (const cfg of Object.values(CONFIGS)) {
-      expect(evaluateSla(0, cfg)).toBe("met");
+    for (const severity of CANONICAL_SEVERITIES) {
+      expect(evaluateSla(0, CONFIGS[severity])).toBe("met");
     }
   });
 
   it("MTTR of 1 meets threshold when threshold >= 1", () => {
-    for (const cfg of Object.values(CONFIGS)) {
-      expect(evaluateSla(1, cfg)).toBe("met");
+    for (const severity of CANONICAL_SEVERITIES) {
+      expect(evaluateSla(1, CONFIGS[severity])).toBe("met");
     }
   });
 
   it("MTTR exactly at threshold is met (inclusive boundary)", () => {
-    for (const cfg of Object.values(CONFIGS)) {
+    for (const severity of CANONICAL_SEVERITIES) {
+      const cfg = CONFIGS[severity];
       expect(evaluateSla(cfg.threshold, cfg)).toBe("met");
     }
   });
@@ -54,7 +57,8 @@ describe("SC-046 Threshold Edge Cases", () => {
   });
 
   it("MTTR one above threshold is violated", () => {
-    for (const cfg of Object.values(CONFIGS)) {
+    for (const severity of CANONICAL_SEVERITIES) {
+      const cfg = CONFIGS[severity];
       expect(evaluateSla(cfg.threshold + 1, cfg)).toBe("violated");
     }
   });
@@ -73,6 +77,11 @@ describe("SC-046 Threshold Edge Cases", () => {
 
   it("negative MTTR is rejected as invalid", () => {
     expect(evaluateSla(-1, CONFIGS.critical)).toBe("invalid");
+  });
+
+  it("uses a documented canonical severity order for backend fixtures", () => {
+    expect(CANONICAL_SEVERITIES).toEqual(["critical", "high", "medium"]);
+    expect(Object.keys(CONFIGS)).toEqual([...CANONICAL_SEVERITIES]);
   });
 
   it("near-zero MTTR (0.001) treated as zero — rounds to met", () => {
