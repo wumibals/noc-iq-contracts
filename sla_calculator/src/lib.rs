@@ -88,12 +88,12 @@ pub enum SLAError {
     Unauthorized = 3,
     ConfigNotFound = 4,
     VersionMismatch = 5,
-    ContractPaused = 6,    // #27
-    NoPendingTransfer = 7, // #63 #64
-    InvalidThreshold = 8,   // #70
-    InvalidPenalty = 9,    // #70
-    InvalidReward = 10,    // #70
-    InvalidSeverity = 11,  // #70
+    ContractPaused = 6,            // #27
+    NoPendingTransfer = 7,         // #63 #64
+    InvalidThreshold = 8,          // #70
+    InvalidPenalty = 9,            // #70
+    InvalidReward = 10,            // #70
+    InvalidSeverity = 11,          // #70
     RetentionLimitOutOfRange = 12, // SC-013
 }
 
@@ -319,9 +319,7 @@ impl SLACalculatorContract {
 
         // v0 → v1: stamp the version; all other fields were set by initialize
         if current == 0 {
-            env.storage()
-                .instance()
-                .set(&STORAGE_VERSION_KEY, &1u32);
+            env.storage().instance().set(&STORAGE_VERSION_KEY, &1u32);
             current = 1;
         }
 
@@ -447,9 +445,7 @@ impl SLACalculatorContract {
     ) -> Result<(), SLAError> {
         Self::check_version(&env)?;
         Self::require_admin(&env, &caller)?;
-        env.storage()
-            .instance()
-            .set(&PENDING_OP_KEY, &new_operator);
+        env.storage().instance().set(&PENDING_OP_KEY, &new_operator);
         env.events()
             .publish((EVENT_OP_PROP, EVENT_VERSION, caller), (new_operator,));
         Ok(())
@@ -569,7 +565,12 @@ impl SLACalculatorContract {
         Self::require_admin(&env, &caller)?; // #28 – admin role enforced
 
         // #70 – Validate configuration parameters
-        Self::validate_config(&severity, threshold_minutes, penalty_per_minute, reward_base)?;
+        Self::validate_config(
+            &severity,
+            threshold_minutes,
+            penalty_per_minute,
+            reward_base,
+        )?;
 
         let mut configs: Map<Symbol, SLAConfig> = env
             .storage()
@@ -612,14 +613,8 @@ impl SLACalculatorContract {
         Self::check_version(&env)?;
 
         let mut entries = Vec::new(&env);
-        let severities = [
-            symbol_short!("critical"),
-            symbol_short!("high"),
-            symbol_short!("medium"),
-            symbol_short!("low"),
-        ];
 
-        for severity in severities {
+        for severity in Self::canonical_severities(&env) {
             let config = Self::load_config(&env, &severity)?;
             entries.push_back(SLAConfigEntry { severity, config });
         }
@@ -641,6 +636,50 @@ impl SLACalculatorContract {
     pub fn get_config_version_hash(env: Env) -> Result<u64, SLAError> {
         Self::check_version(&env)?;
         Self::compute_config_version_hash(&env)
+        let severities = Self::canonical_severities(&env);
+
+        // Polynomial rolling hash parameters for good collision resistance
+        const BASE: u64 = 91138233; // Large prime number
+        const MODULUS: u64 = (1u64 << 63) - 25; // Large prime (Mersenne-like)
+
+        let mut hash: u64 = 1; // Start with non-zero seed
+        let mut power: u64 = 1;
+
+        for sev in severities {
+            let cfg = Self::load_config(&env, &sev)?;
+
+            // Mix each field with position-dependent weights
+            let field_hash = hash
+                .wrapping_mul(BASE)
+                .wrapping_add(cfg.threshold_minutes as u64)
+                .wrapping_mul(power)
+                % MODULUS;
+
+            hash = field_hash;
+            power = power.wrapping_mul(BASE) % MODULUS;
+
+            // Add penalty_per_minute with different weight
+            hash = hash
+                .wrapping_mul(BASE)
+                .wrapping_add(cfg.penalty_per_minute as u64)
+                .wrapping_mul(power)
+                % MODULUS;
+
+            power = power.wrapping_mul(BASE) % MODULUS;
+
+            // Add reward_base with different weight
+            hash = hash
+                .wrapping_mul(BASE)
+                .wrapping_add(cfg.reward_base as u64)
+                .wrapping_mul(power)
+                % MODULUS;
+
+            power = power.wrapping_mul(BASE) % MODULUS;
+        }
+
+        // Final mixing to improve distribution
+        hash = hash.wrapping_mul(BASE).wrapping_add(0x9e3779b97f4a7c15u64) % MODULUS;
+        Ok(hash)
     }
 
     pub fn get_result_schema(env: Env) -> Result<SLAResultSchema, SLAError> {
@@ -663,11 +702,7 @@ impl SLACalculatorContract {
     /// #60 – Returns static contract capabilities for backend introspection.
     pub fn get_contract_metadata(env: Env) -> Result<ContractMetadata, SLAError> {
         Self::check_version(&env)?;
-        let mut severities = Vec::new(&env);
-        severities.push_back(symbol_short!("critical"));
-        severities.push_back(symbol_short!("high"));
-        severities.push_back(symbol_short!("medium"));
-        severities.push_back(symbol_short!("low"));
+        let severities = Self::canonical_severities(&env);
 
         let mut features = Vec::new(&env);
         features.push_back(symbol_short!("calc"));
@@ -716,12 +751,17 @@ impl SLACalculatorContract {
         let config_version_hash = Self::compute_config_version_hash(&env)?;
 
         // Delegate to pure internal math without mutating state or emitting events.
+
+        // Use the current ledger timestamp so the view result matches the mutating
+        // path for the same inputs executed in the same ledger, while still avoiding
+        // any state writes or event emission.
         Ok(Self::compute_result(
             outage_id,
             mttr_minutes,
             &cfg,
             config_version_hash,
             0,
+            env.ledger().timestamp(),
         ))
     }
 
@@ -797,6 +837,7 @@ impl SLACalculatorContract {
     /// `config_version_hash` binds the result to the exact config snapshot used
     /// during evaluation. `recorded_at` is the ledger timestamp at call time
     /// (0 in view/audit mode).
+    /// `recorded_at` is the ledger timestamp at call time (0 in view/audit mode).
     fn compute_result(
         outage_id: Symbol,
         mttr_minutes: u32,
@@ -914,13 +955,7 @@ impl SLACalculatorContract {
         reward_base: i128,
     ) -> Result<(), SLAError> {
         // Validate severity is one of the supported values
-        let valid_severities = [
-            symbol_short!("critical"),
-            symbol_short!("high"),
-            symbol_short!("medium"),
-            symbol_short!("low"),
-        ];
-        if !valid_severities.contains(severity) {
+        if !Self::is_canonical_severity(severity) {
             return Err(SLAError::InvalidSeverity);
         }
 
@@ -974,6 +1009,33 @@ impl SLACalculatorContract {
         }
 
         Ok(())
+    }
+
+    fn canonical_severities(env: &Env) -> Vec<Symbol> {
+        let mut severities = Vec::new(env);
+        severities.push_back(symbol_short!("critical"));
+        severities.push_back(symbol_short!("high"));
+        severities.push_back(symbol_short!("medium"));
+        severities.push_back(symbol_short!("low"));
+        severities
+    }
+
+    fn canonical_severity_index(severity: &Symbol) -> Option<u32> {
+        if *severity == symbol_short!("critical") {
+            Some(0)
+        } else if *severity == symbol_short!("high") {
+            Some(1)
+        } else if *severity == symbol_short!("medium") {
+            Some(2)
+        } else if *severity == symbol_short!("low") {
+            Some(3)
+        } else {
+            None
+        }
+    }
+
+    fn is_canonical_severity(severity: &Symbol) -> bool {
+        Self::canonical_severity_index(severity).is_some()
     }
 
     /// Shared config lookup that borrows env (avoids consuming it).
@@ -1156,10 +1218,8 @@ impl SLACalculatorContract {
         if removed > 0 {
             let kept = new_history.len();
             env.storage().instance().set(&HISTORY_KEY, &new_history);
-            env.events().publish(
-                (EVENT_PRUNED_AGE, EVENT_VERSION, caller),
-                (removed, kept),
-            );
+            env.events()
+                .publish((EVENT_PRUNED_AGE, EVENT_VERSION, caller), (removed, kept));
         }
 
         Ok(())
@@ -1197,10 +1257,7 @@ impl SLACalculatorContract {
 
     /// Returns all history entries whose `outage_id` matches the given value.
     /// Returns an empty Vec when no matching entries exist.
-    pub fn get_history_by_outage(
-        env: Env,
-        outage_id: Symbol,
-    ) -> Result<Vec<SLAResult>, SLAError> {
+    pub fn get_history_by_outage(env: Env, outage_id: Symbol) -> Result<Vec<SLAResult>, SLAError> {
         Self::check_version(&env)?;
         let history: Vec<SLAResult> = env
             .storage()
