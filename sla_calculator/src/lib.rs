@@ -803,6 +803,11 @@ impl SLACalculatorContract {
             }
         }
         if let Some(prev) = existing {
+            // Explicit duplicate policy: same outage_id is idempotent only when
+            // execution inputs resolve to the same deterministic result.
+            if prev.mttr_minutes != mttr_minutes || prev.threshold_minutes != cfg.threshold_minutes {
+                panic!("duplicate outage_id with mismatched execution inputs");
+            }
             return Ok(prev);
         }
 
