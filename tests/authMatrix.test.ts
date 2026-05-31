@@ -13,15 +13,20 @@ interface AuthEntry {
 
 const AUTH_MATRIX: AuthEntry[] = [
   { method: "initialize",       requiredRole: "anyone",   rejectedActors: [] },
+  { method: "migrate",          requiredRole: "admin",    rejectedActors: ["operator", "stranger"] },
   { method: "set_config",       requiredRole: "admin",    rejectedActors: ["operator", "stranger"] },
   { method: "pause",            requiredRole: "admin",    rejectedActors: ["operator", "stranger"] },
   { method: "unpause",          requiredRole: "admin",    rejectedActors: ["operator", "stranger"] },
   { method: "prune_history",    requiredRole: "admin",    rejectedActors: ["operator", "stranger"] },
+  { method: "prune_history_by_age", requiredRole: "admin", rejectedActors: ["operator", "stranger"] },
   { method: "propose_admin",    requiredRole: "admin",    rejectedActors: ["operator", "stranger"] },
   { method: "accept_admin",     requiredRole: "anyone",   rejectedActors: ["stranger"] },
+  { method: "cancel_admin_proposal", requiredRole: "admin", rejectedActors: ["operator", "stranger"] },
   { method: "renounce_admin",   requiredRole: "admin",    rejectedActors: ["operator", "stranger"] },
+  { method: "set_operator",     requiredRole: "admin",    rejectedActors: ["operator", "stranger"] },
   { method: "propose_operator", requiredRole: "admin",    rejectedActors: ["operator", "stranger"] },
   { method: "accept_operator",  requiredRole: "anyone",   rejectedActors: ["stranger"] },
+  { method: "cancel_operator_proposal", requiredRole: "admin", rejectedActors: ["operator", "stranger"] },
   { method: "calculate_sla",    requiredRole: "operator", rejectedActors: ["admin", "stranger"] },
 ];
 

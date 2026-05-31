@@ -7,13 +7,17 @@ export type GovernanceEventKind =
   | "admin_renounced"
   | "operator_proposed"
   | "operator_accepted"
-  | "proposal_cancelled";
+  | "proposal_cancelled"
+  | "governance_locked"
+  | "governance_unlocked";
 
 export interface GovernanceEvent {
   kind: GovernanceEventKind;
   actor: string;
   target: string | null;
   ledger: number;
+  reason?: string;
+  metadata?: Record<string, string>;
 }
 
 const eventLog: GovernanceEvent[] = [];
@@ -49,4 +53,36 @@ export function onOperatorProposed(actor: string, target: string, ledger: number
 
 export function onOperatorAccepted(actor: string, ledger: number): void {
   emitGovernanceEvent({ kind: "operator_accepted", actor, target: null, ledger });
+}
+
+export function onGovernanceLocked(
+  actor: string,
+  ledger: number,
+  reason: string,
+  metadata: Record<string, string> = {},
+): void {
+  emitGovernanceEvent({
+    kind: "governance_locked",
+    actor,
+    target: null,
+    ledger,
+    reason,
+    metadata,
+  });
+}
+
+export function onGovernanceUnlocked(
+  actor: string,
+  ledger: number,
+  reason: string,
+  metadata: Record<string, string> = {},
+): void {
+  emitGovernanceEvent({
+    kind: "governance_unlocked",
+    actor,
+    target: null,
+    ledger,
+    reason,
+    metadata,
+  });
 }
