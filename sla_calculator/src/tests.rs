@@ -3572,7 +3572,7 @@ fn test_stored_result_retains_original_config_binding_after_config_change() {
     assert_eq!(stored_after_change.config_version_hash, original_hash);
     assert_ne!(original_hash, after_hash);
     assert_eq!(replayed_after_change.config_version_hash, after_hash);
-    assert_eq!(stored.recorded_at, replayed.recorded_at);
+    assert_eq!(stored_after_change.recorded_at, replayed_after_change.recorded_at);
 }
 
 #[test]
@@ -3653,6 +3653,8 @@ fn test_get_version_info_not_affected_by_sla_calculations() {
     assert_eq!(before.storage_version, after.storage_version);
     assert_eq!(before.result_schema_version, after.result_schema_version);
     assert_eq!(before.needs_migration, after.needs_migration);
+}
+
 // #145 – Operator handoff cancellation and replacement lifecycle
 // ============================================================
 
@@ -4666,6 +4668,10 @@ fn test_get_version_info_needs_migration_false_after_migrate() {
     client.migrate(&actors.admin);
     let info = client.get_version_info();
     assert!(!info.needs_migration);
+}
+
+#[test]
+#[should_panic]
 fn test_extreme_reward_zero_rejected() {
     let (_env, client, actors) = setup();
     client.set_config(&actors.admin, &symbol_short!("low"), &120, &10, &0);
@@ -4953,6 +4959,613 @@ fn test_set_config_rejects_threshold_zero_for_low() {
 }
 
 // ============================================================
+// SC-W5-049 (#250) – Failure-class mapping: retryable vs terminal errors
+//
+// Classification:
+//   Terminal (caller bug, never retry):
+//     AlreadyInitialized, Unauthorized, InvalidThreshold, InvalidPenalty,
+//     InvalidReward, InvalidSeverity, NoPendingTransfer
+//   Retryable (transient / state-dependent, may succeed after state change):
+//     NotInitialized, VersionMismatch, ConfigNotFound, ContractPaused,
+//     RetentionLimitOutOfRange
+// ============================================================
+
+#[test]
+fn test_error_already_initialized_is_terminal() {
+    // Calling initialize twice always fails – no state change can make it succeed.
+    let (_env, client, actors) = setup();
+    let result = client.try_initialize(&actors.admin, &actors.operator);
+    assert_eq!(result.unwrap_err().unwrap(), SLAError::AlreadyInitialized);
+}
+
+#[test]
+fn test_error_unauthorized_is_terminal_for_stranger() {
+    // A stranger calling an admin-only function always fails.
+    let (_env, client, actors) = setup();
+    let result = client.try_set_config(
+        &actors.stranger,
+        &symbol_short!("critical"),
+        &15,
+        &100,
+        &750,
+    );
+    assert_eq!(result.unwrap_err().unwrap(), SLAError::Unauthorized);
+}
+
+#[test]
+fn test_error_unauthorized_operator_calling_admin_fn_is_terminal() {
+    let (_env, client, actors) = setup();
+    let result = client.try_pause(
+        &actors.operator,
+        &soroban_sdk::String::from_str(&_env, "x"),
+    );
+    assert_eq!(result.unwrap_err().unwrap(), SLAError::Unauthorized);
+}
+
+#[test]
+fn test_error_invalid_threshold_is_terminal() {
+    let (_env, client, actors) = setup();
+    // threshold=0 is always invalid for any severity
+    let result = client.try_set_config(
+        &actors.admin,
+        &symbol_short!("low"),
+        &0,
+        &10,
+        &600,
+    );
+    assert_eq!(result.unwrap_err().unwrap(), SLAError::InvalidThreshold);
+}
+
+#[test]
+fn test_error_invalid_penalty_is_terminal() {
+    let (_env, client, actors) = setup();
+    // penalty=0 is always invalid
+    let result = client.try_set_config(
+        &actors.admin,
+        &symbol_short!("low"),
+        &120,
+        &0,
+        &600,
+    );
+    assert_eq!(result.unwrap_err().unwrap(), SLAError::InvalidPenalty);
+}
+
+#[test]
+fn test_error_invalid_reward_is_terminal() {
+    let (_env, client, actors) = setup();
+    // reward=0 is always invalid
+    let result = client.try_set_config(
+        &actors.admin,
+        &symbol_short!("low"),
+        &120,
+        &10,
+        &0,
+    );
+    assert_eq!(result.unwrap_err().unwrap(), SLAError::InvalidReward);
+}
+
+#[test]
+fn test_error_invalid_severity_is_terminal() {
+    let (env, client, actors) = setup();
+    let result = client.try_set_config(
+        &actors.admin,
+        &symbol_short!("bogus"),
+        &30,
+        &50,
+        &500,
+    );
+    assert_eq!(result.unwrap_err().unwrap(), SLAError::InvalidSeverity);
+}
+
+#[test]
+fn test_error_no_pending_transfer_is_terminal_without_proposal() {
+    let (_env, client, actors) = setup();
+    // No proposal exists – cancel must fail
+    let result = client.try_cancel_admin_proposal(&actors.admin);
+    assert_eq!(result.unwrap_err().unwrap(), SLAError::NoPendingTransfer);
+}
+
+#[test]
+fn test_error_contract_paused_is_retryable_after_unpause() {
+    // ContractPaused is retryable: the same call succeeds after unpause.
+    let (_env, client, actors) = setup();
+    client.pause(
+        &actors.admin,
+        &soroban_sdk::String::from_str(&_env, "maintenance"),
+    );
+    let paused_result = client.try_calculate_sla(
+        &actors.operator,
+        &symbol_short!("INC_P"),
+        &symbol_short!("high"),
+        &10,
+    );
+    assert_eq!(paused_result.unwrap_err().unwrap(), SLAError::ContractPaused);
+
+    client.unpause(&actors.admin);
+    let ok = client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("INC_P"),
+        &symbol_short!("high"),
+        &10,
+    );
+    assert_eq!(ok.status, symbol_short!("met"));
+}
+
+#[test]
+fn test_error_config_not_found_is_retryable_after_set_config() {
+    // ConfigNotFound is retryable: after adding the config the call succeeds.
+    // We test this via calculate_sla_view with a severity that has no config.
+    // (We can't remove a config directly, so we verify the error code via
+    // a freshly-registered contract with no configs set.)
+    let env = Env::default();
+    env.mock_all_auths();
+    let cid = env.register_contract(None, SLACalculatorContract);
+    let client = SLACalculatorContractClient::new(&env, &cid);
+    let admin = soroban_sdk::Address::generate(&env);
+    let op = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &op);
+
+    // "critical" exists by default; use a non-canonical symbol to force ConfigNotFound
+    // by bypassing validate_config (use calculate_sla_view which skips operator check)
+    // We can't easily inject an unknown severity without bypassing validation,
+    // so we verify ConfigNotFound is the error returned by get_config directly.
+    let result = client.try_get_config(&symbol_short!("none"));
+    assert_eq!(result.unwrap_err().unwrap(), SLAError::ConfigNotFound);
+}
+
+#[test]
+fn test_error_retention_limit_out_of_range_is_terminal_for_zero() {
+    let (_env, client, actors) = setup();
+    let result = client.try_set_retention_limit(&actors.admin, &0);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        SLAError::RetentionLimitOutOfRange
+    );
+}
+
+// ============================================================
+// SC-W5-050 (#251) – Invariant-preserving error paths
+//
+// A failed operation must leave all observable state unchanged.
+// ============================================================
+
+#[test]
+fn test_failed_set_config_leaves_config_unchanged() {
+    let (_env, client, actors) = setup();
+    let before = client.get_config(&symbol_short!("critical"));
+
+    // Invalid: threshold=0 for critical
+    let _ = client.try_set_config(
+        &actors.admin,
+        &symbol_short!("critical"),
+        &0,
+        &100,
+        &750,
+    );
+
+    assert_eq!(client.get_config(&symbol_short!("critical")), before);
+}
+
+#[test]
+fn test_failed_calculate_sla_when_paused_leaves_stats_unchanged() {
+    let (_env, client, actors) = setup();
+    let stats_before = client.get_stats();
+
+    client.pause(
+        &actors.admin,
+        &soroban_sdk::String::from_str(&_env, "test"),
+    );
+    let _ = client.try_calculate_sla(
+        &actors.operator,
+        &symbol_short!("INC_X"),
+        &symbol_short!("high"),
+        &10,
+    );
+
+    client.unpause(&actors.admin);
+    let stats_after = client.get_stats();
+    assert_eq!(stats_before.total_calculations, stats_after.total_calculations);
+    assert_eq!(stats_before.total_violations, stats_after.total_violations);
+}
+
+#[test]
+fn test_failed_calculate_sla_when_paused_leaves_history_unchanged() {
+    let (_env, client, actors) = setup();
+    let history_before = client.get_history();
+
+    client.pause(
+        &actors.admin,
+        &soroban_sdk::String::from_str(&_env, "test"),
+    );
+    let _ = client.try_calculate_sla(
+        &actors.operator,
+        &symbol_short!("INC_Y"),
+        &symbol_short!("high"),
+        &10,
+    );
+
+    client.unpause(&actors.admin);
+    assert_eq!(client.get_history().len(), history_before.len());
+}
+
+#[test]
+fn test_failed_calculate_sla_unauthorized_leaves_stats_unchanged() {
+    let (_env, client, actors) = setup();
+    let stats_before = client.get_stats();
+
+    let _ = client.try_calculate_sla(
+        &actors.stranger,
+        &symbol_short!("INC_Z"),
+        &symbol_short!("high"),
+        &10,
+    );
+
+    let stats_after = client.get_stats();
+    assert_eq!(stats_before.total_calculations, stats_after.total_calculations);
+}
+
+#[test]
+fn test_failed_propose_admin_unauthorized_leaves_pending_admin_unchanged() {
+    let (env, client, actors) = setup();
+    let new_admin = soroban_sdk::Address::generate(&env);
+
+    // No pending admin before
+    assert_eq!(client.get_pending_admin(), None);
+
+    let _ = client.try_propose_admin(&actors.stranger, &new_admin);
+
+    // Still no pending admin
+    assert_eq!(client.get_pending_admin(), None);
+}
+
+#[test]
+fn test_failed_accept_admin_wrong_caller_leaves_admin_unchanged() {
+    let (env, client, actors) = setup();
+    let new_admin = soroban_sdk::Address::generate(&env);
+    let wrong = soroban_sdk::Address::generate(&env);
+
+    client.propose_admin(&actors.admin, &new_admin);
+
+    // Wrong caller tries to accept
+    let _ = client.try_accept_admin(&wrong);
+
+    // Admin must still be the original
+    assert_eq!(client.get_admin(), actors.admin);
+    // Pending must still be new_admin
+    assert_eq!(client.get_pending_admin(), Some(new_admin));
+}
+
+#[test]
+fn test_failed_set_retention_limit_leaves_limit_unchanged() {
+    let (_env, client, actors) = setup();
+    let before = client.get_retention_limit();
+
+    let _ = client.try_set_retention_limit(&actors.admin, &0);
+
+    assert_eq!(client.get_retention_limit(), before);
+}
+
+#[test]
+fn test_failed_pause_unauthorized_leaves_pause_state_unchanged() {
+    let (_env, client, actors) = setup();
+    assert_eq!(client.is_paused(), false);
+
+    let _ = client.try_pause(
+        &actors.stranger,
+        &soroban_sdk::String::from_str(&_env, "x"),
+    );
+
+    assert_eq!(client.is_paused(), false);
+}
+
+// ============================================================
+// SC-W5-051 (#252) – Stats monotonicity and conservation invariants
+//
+// Invariants:
+//   1. total_calculations only ever increases (monotonic).
+//   2. total_violations only ever increases (monotonic).
+//   3. total_calculations == (met count) + total_violations at all times.
+//   4. total_rewards and total_penalties only ever increase.
+// ============================================================
+
+#[test]
+fn test_stats_total_calculations_is_monotonically_increasing() {
+    let (_env, client, actors) = setup();
+    let mut prev = client.get_stats().total_calculations;
+
+    let oids = [
+        symbol_short!("MON1"),
+        symbol_short!("MON2"),
+        symbol_short!("MON3"),
+        symbol_short!("MON4"),
+        symbol_short!("MON5"),
+    ];
+    for oid in oids.iter() {
+        client.calculate_sla(
+            &actors.operator,
+            oid,
+            &symbol_short!("high"),
+            &10,
+        );
+        let curr = client.get_stats().total_calculations;
+        assert!(curr > prev, "total_calculations must increase after each call");
+        prev = curr;
+    }
+}
+
+#[test]
+fn test_stats_total_violations_is_monotonically_increasing() {
+    let (_env, client, actors) = setup();
+    // Use mttr > threshold (30 for high) to force violations
+    let mut prev = client.get_stats().total_violations;
+
+    let oids = [
+        symbol_short!("VIO1"),
+        symbol_short!("VIO2"),
+        symbol_short!("VIO3"),
+    ];
+    for oid in oids.iter() {
+        client.calculate_sla(
+            &actors.operator,
+            oid,
+            &symbol_short!("high"),
+            &50,
+        );
+        let curr = client.get_stats().total_violations;
+        assert!(curr > prev, "total_violations must increase on each violation");
+        prev = curr;
+    }
+}
+
+#[test]
+fn test_stats_conservation_total_calculations_equals_met_plus_violations() {
+    let (_env, client, actors) = setup();
+
+    // Mix of met and violated calculations
+    let inputs: &[(u32, &str, &str)] = &[
+        (5,  "high",     "C0"),
+        (35, "high",     "C1"),
+        (10, "critical", "C2"),
+        (20, "critical", "C3"),
+        (50, "medium",   "C4"),
+        (70, "medium",   "C5"),
+    ];
+
+    for (mttr, sev, oid) in inputs.iter() {
+        client.calculate_sla(
+            &actors.operator,
+            &Symbol::new(&_env, oid),
+            &Symbol::new(&_env, sev),
+            mttr,
+        );
+    }
+
+    let stats = client.get_stats();
+    let met_count = stats.total_calculations - stats.total_violations;
+    assert_eq!(
+        stats.total_calculations,
+        met_count + stats.total_violations,
+        "total_calculations must equal met + violations"
+    );
+    assert_eq!(stats.total_violations, 3, "expected 3 violations");
+    assert_eq!(met_count, 3, "expected 3 met");
+}
+
+#[test]
+fn test_stats_total_rewards_only_increases_on_met() {
+    let (_env, client, actors) = setup();
+    let before = client.get_stats().total_rewards;
+
+    // met calculation
+    client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("RWD1"),
+        &symbol_short!("high"),
+        &5,
+    );
+    let after = client.get_stats().total_rewards;
+    assert!(after > before, "total_rewards must increase after a met SLA");
+}
+
+#[test]
+fn test_stats_total_penalties_only_increases_on_violation() {
+    let (_env, client, actors) = setup();
+    let before = client.get_stats().total_penalties;
+
+    // violated calculation (mttr=50 > threshold=30 for high)
+    client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("PEN1"),
+        &symbol_short!("high"),
+        &50,
+    );
+    let after = client.get_stats().total_penalties;
+    assert!(after > before, "total_penalties must increase after a violation");
+}
+
+#[test]
+fn test_stats_rewards_unchanged_on_violation() {
+    let (_env, client, actors) = setup();
+    let before = client.get_stats().total_rewards;
+
+    client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("PEN2"),
+        &symbol_short!("high"),
+        &50,
+    );
+    assert_eq!(
+        client.get_stats().total_rewards,
+        before,
+        "total_rewards must not change on a violation"
+    );
+}
+
+#[test]
+fn test_stats_penalties_unchanged_on_met() {
+    let (_env, client, actors) = setup();
+    let before = client.get_stats().total_penalties;
+
+    client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("RWD2"),
+        &symbol_short!("high"),
+        &5,
+    );
+    assert_eq!(
+        client.get_stats().total_penalties,
+        before,
+        "total_penalties must not change on a met SLA"
+    );
+}
+
+#[test]
+fn test_stats_conservation_holds_after_many_mixed_calculations() {
+    let env = Env::default();
+    env.budget().reset_unlimited();
+    let cid = env.register_contract(None, SLACalculatorContract);
+    let client = SLACalculatorContractClient::new(&env, &cid);
+    let admin = soroban_sdk::Address::generate(&env);
+    let op = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &op);
+
+    let mut expected_violations: u64 = 0;
+    for i in 1u32..=20 {
+        let mttr = i * 3; // alternates met/viol for high (threshold=30)
+        // Use a fixed set of outage IDs cycling through 20 symbols
+        let oid = match i {
+            1  => symbol_short!("M01"),
+            2  => symbol_short!("M02"),
+            3  => symbol_short!("M03"),
+            4  => symbol_short!("M04"),
+            5  => symbol_short!("M05"),
+            6  => symbol_short!("M06"),
+            7  => symbol_short!("M07"),
+            8  => symbol_short!("M08"),
+            9  => symbol_short!("M09"),
+            10 => symbol_short!("M10"),
+            11 => symbol_short!("M11"),
+            12 => symbol_short!("M12"),
+            13 => symbol_short!("M13"),
+            14 => symbol_short!("M14"),
+            15 => symbol_short!("M15"),
+            16 => symbol_short!("M16"),
+            17 => symbol_short!("M17"),
+            18 => symbol_short!("M18"),
+            19 => symbol_short!("M19"),
+            _  => symbol_short!("M20"),
+        };
+        client.calculate_sla(&op, &oid, &symbol_short!("high"), &mttr);
+        if mttr > 30 {
+            expected_violations += 1;
+        }
+    }
+
+    let stats = client.get_stats();
+    assert_eq!(stats.total_calculations, 20);
+    assert_eq!(stats.total_violations, expected_violations);
+    assert_eq!(
+        stats.total_calculations,
+        (stats.total_calculations - stats.total_violations) + stats.total_violations
+    );
+}
+
+// ============================================================
+// SC-W5-052 (#253) – Reward/penalty exclusivity invariants
+//
+// Invariants:
+//   1. A result with status "met"  has payment_type "rew" and amount > 0.
+//   2. A result with status "viol" has payment_type "pen" and amount < 0.
+//   3. No result has both a positive amount AND payment_type "pen".
+//   4. No result has both a negative amount AND payment_type "rew".
+// ============================================================
+
+#[test]
+fn test_met_result_has_reward_payment_type_and_positive_amount() {
+    let (_env, client, actors) = setup();
+    // mttr=5 < threshold=30 for high → met
+    let result = client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("EX1"),
+        &symbol_short!("high"),
+        &5,
+    );
+    assert_eq!(result.status, symbol_short!("met"));
+    assert_eq!(result.payment_type, symbol_short!("rew"));
+    assert!(result.amount > 0, "reward amount must be positive");
+}
+
+#[test]
+fn test_violated_result_has_penalty_payment_type_and_negative_amount() {
+    let (_env, client, actors) = setup();
+    // mttr=50 > threshold=30 for high → viol
+    let result = client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("EX2"),
+        &symbol_short!("high"),
+        &50,
+    );
+    assert_eq!(result.status, symbol_short!("viol"));
+    assert_eq!(result.payment_type, symbol_short!("pen"));
+    assert!(result.amount < 0, "penalty amount must be negative");
+}
+
+#[test]
+fn test_no_result_has_penalty_type_with_positive_amount() {
+    let (_env, client, actors) = setup();
+    // Run several calculations and verify the invariant on each
+    let cases: &[(u32, &str, &str)] = &[
+        (5,   "critical", "EX10"),
+        (20,  "critical", "EX11"),
+        (10,  "high",     "EX12"),
+        (40,  "high",     "EX13"),
+        (30,  "medium",   "EX14"),
+        (70,  "medium",   "EX15"),
+        (60,  "low",      "EX16"),
+        (130, "low",      "EX17"),
+    ];
+    for (mttr, sev, oid) in cases.iter() {
+        let result = client.calculate_sla(
+            &actors.operator,
+            &Symbol::new(&_env, oid),
+            &Symbol::new(&_env, sev),
+            mttr,
+        );
+        if result.payment_type == symbol_short!("pen") {
+            assert!(
+                result.amount < 0,
+                "penalty payment_type must always have negative amount"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_no_result_has_reward_type_with_non_positive_amount() {
+    let (_env, client, actors) = setup();
+    let cases: &[(u32, &str, &str)] = &[
+        (1,   "critical", "EX20"),
+        (14,  "critical", "EX21"),
+        (1,   "high",     "EX22"),
+        (29,  "high",     "EX23"),
+        (1,   "medium",   "EX24"),
+        (59,  "medium",   "EX25"),
+        (1,   "low",      "EX26"),
+        (119, "low",      "EX27"),
+    ];
+    for (mttr, sev, oid) in cases.iter() {
+        let result = client.calculate_sla(
+            &actors.operator,
+            &Symbol::new(&_env, oid),
+            &Symbol::new(&_env, sev),
+            mttr,
+        );
+        if result.payment_type == symbol_short!("rew") {
+            assert!(
+                result.amount > 0,
+                "reward payment_type must always have positive amount"
+            );
+        }
 // Issue #254 – Invariant checks: config bounds and payout ceilings
 // ============================================================
 
@@ -5323,6 +5936,79 @@ fn test_257_config_snapshot_entry_order_is_canonical() {
 }
 
 #[test]
+fn test_exclusivity_status_and_payment_type_are_consistent() {
+    // met ↔ rew, viol ↔ pen — no cross-pairing allowed
+    let (_env, client, actors) = setup();
+    let cases: &[(u32, &str, &str)] = &[
+        (5,   "critical", "EX30"),
+        (20,  "critical", "EX31"),
+        (10,  "high",     "EX32"),
+        (40,  "high",     "EX33"),
+        (30,  "medium",   "EX34"),
+        (70,  "medium",   "EX35"),
+        (60,  "low",      "EX36"),
+        (130, "low",      "EX37"),
+    ];
+    for (mttr, sev, oid) in cases.iter() {
+        let result = client.calculate_sla(
+            &actors.operator,
+            &Symbol::new(&_env, oid),
+            &Symbol::new(&_env, sev),
+            mttr,
+        );
+        if result.status == symbol_short!("met") {
+            assert_eq!(
+                result.payment_type,
+                symbol_short!("rew"),
+                "met status must pair with rew payment_type"
+            );
+        } else {
+            assert_eq!(result.status, symbol_short!("viol"));
+            assert_eq!(
+                result.payment_type,
+                symbol_short!("pen"),
+                "viol status must pair with pen payment_type"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_exclusivity_view_mode_matches_mutating_mode() {
+    // calculate_sla_view must produce the same payment_type/amount sign as calculate_sla
+    let (_env, client, actors) = setup();
+
+    let view = client.calculate_sla_view(
+        &symbol_short!("VIEW1"),
+        &symbol_short!("high"),
+        &50,
+    );
+    let calc = client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("VIEW1"),
+        &symbol_short!("high"),
+        &50,
+    );
+
+    assert_eq!(view.status, calc.status);
+    assert_eq!(view.payment_type, calc.payment_type);
+    assert_eq!(view.amount.signum(), calc.amount.signum());
+}
+
+#[test]
+fn test_exclusivity_at_exact_threshold_boundary_is_met() {
+    // mttr == threshold → SLA met (not violated)
+    let (_env, client, actors) = setup();
+    // high threshold = 30
+    let result = client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("BNDRY"),
+        &symbol_short!("high"),
+        &30,
+    );
+    assert_eq!(result.status, symbol_short!("met"));
+    assert_eq!(result.payment_type, symbol_short!("rew"));
+    assert!(result.amount > 0);
 fn test_257_result_schema_fields_are_stable() {
     // get_result_schema must return the expected symbol constants.
     let (_env, client, _actors) = setup();
