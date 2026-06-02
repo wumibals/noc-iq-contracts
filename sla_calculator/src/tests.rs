@@ -1915,6 +1915,7 @@ fn test_pause_stores_reason_and_timestamp() {
         .get_pause_info()
         .expect("pause info should be present");
     assert_eq!(info.reason, reason);
+    assert_eq!(info.paused_by, actors.admin);
     // timestamp is ledger time; just assert it is non-zero in a real ledger,
     // in test env it defaults to 0 which is still a valid u64
     let _ = info.paused_at;

@@ -185,6 +185,7 @@ pub struct SLAStats {
 pub struct PauseInfo {
     pub reason: String,
     pub paused_at: u64, // ledger timestamp (seconds)
+    pub paused_by: Address,
 }
 
 /// SC-021 – Storage version and migration posture for off-chain consumers.
@@ -580,7 +581,14 @@ impl SLACalculatorContract {
         env.storage().instance().set(&PAUSED_KEY, &true);
         env.storage()
             .instance()
-            .set(&PAUSE_INFO_KEY, &PauseInfo { reason, paused_at });
+            .set(
+                &PAUSE_INFO_KEY,
+                &PauseInfo {
+                    reason,
+                    paused_at,
+                    paused_by: caller.clone(),
+                },
+            );
         env.events()
             .publish((EVENT_PAUSED, EVENT_VERSION, caller), (true,));
         Ok(())
