@@ -12,6 +12,10 @@ pub struct SLACalculatorContract;
 mod tests;
 
 mod event_schema;
+pub mod cross_contract_safety;
+pub mod event_correlation;
+pub mod version_negotiation;
+pub mod coordination_harness;
 
 // -----------------------------------------------------------------------
 // Storage keys
@@ -784,8 +788,10 @@ impl SLACalculatorContract {
         features.push_back(symbol_short!("audit"));
         features.push_back(symbol_short!("pause"));
         features.push_back(symbol_short!("stats"));
-        features.push_back(symbol_short!("history"));
-        features.push_back(symbol_short!("failcode"));
+        features.push_back(symbol_short!("history"));            features.push_back(symbol_short!("failcode"));
+            features.push_back(symbol_short!("safe_call"));
+            features.push_back(symbol_short!("ver_nego"));
+            features.push_back(symbol_short!("corr_id"));
 
         Ok(ContractMetadata {
             contract_name: symbol_short!("sla_calc"),

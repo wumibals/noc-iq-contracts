@@ -1659,7 +1659,7 @@ fn test_get_contract_metadata_returns_expected_fields() {
     assert_eq!(meta.storage_version, 1);
     assert_eq!(meta.result_schema_version, 1);
     assert_eq!(meta.supported_severities.len(), 4);
-    assert_eq!(meta.features.len(), 5);
+    assert_eq!(meta.features.len(), 9);
 }
 
 #[test]
